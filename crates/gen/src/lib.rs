@@ -59,20 +59,9 @@ impl Megastructure {
     /// (+1) cells lies exactly halfway: gallery floors at y = -0.5,
     /// ceilings at y = 2.5 for the band at y in {0, 1, 2}.
     pub fn sample(&self, p: [f64; 3]) -> f32 {
-        let x0 = p[0].floor() as i64;
-        let y0 = p[1].floor() as i64;
-        let z0 = p[2].floor() as i64;
-        let tx = (p[0] - x0 as f64) as f32;
-        let ty = (p[1] - y0 as f64) as f32;
-        let tz = (p[2] - z0 as f64) as f32;
-        let c = |x: i64, y: i64, z: i64| self.distance(CellId([x, y, z]));
-        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
-        let x00 = lerp(c(x0, y0, z0), c(x0 + 1, y0, z0), tx);
-        let x10 = lerp(c(x0, y0 + 1, z0), c(x0 + 1, y0 + 1, z0), tx);
-        let x01 = lerp(c(x0, y0, z0 + 1), c(x0 + 1, y0, z0 + 1), tx);
-        let x11 = lerp(c(x0, y0 + 1, z0 + 1), c(x0 + 1, y0 + 1, z0 + 1), tx);
-        lerp(lerp(x00, x10, ty), lerp(x01, x11, ty), tz)
+        <Self as Sdf>::sample(self, p)
     }
+
 }
 
 #[cfg(test)]
