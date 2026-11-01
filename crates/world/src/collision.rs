@@ -72,7 +72,7 @@ pub fn move_body(
             let (_, slope) = gradient(sample, c);
             let dist = sample(c) as f64 / slope.clamp(0.25, 8.0);
             let pen = dist - params.radius;
-            if pen < 0.0 && worst.map_or(true, |(_, wp)| pen < wp) {
+            if pen < 0.0 && worst.is_none_or(|(_, wp)| pen < wp) {
                 worst = Some((c, pen));
             }
         }

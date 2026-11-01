@@ -23,7 +23,7 @@ fn main() {
 #[derive(Resource)]
 struct WorldGen(Megastructure);
 
-#[derive(Component)]
+#[derive(Component, Clone, Copy)]
 struct Player {
     vel: [f64; 3],
     grounded: bool,
@@ -242,6 +242,170 @@ fn walk(
         let offset = Vec3::new(sy * cp, -sp, cy * cp) * CAMERA_BOOM;
         cam.translation = head + offset;
         cam.look_at(head, Vec3::Y);
+    }
+}
+
+/// Headless end-to-end: drive the real systems with real input resources
+/// over frames, no window or GPU needed.
+#[cfg(test)]
+mod headless {
+    use super::*;
+    use bevy::input::ButtonState;
+    use bevy::input::InputPlugin;
+    use bevy::input::keyboard::{Key, KeyboardInput};
+    use bevy::input::mouse::MouseButtonInput;
+    use bevy::time::TimeUpdateStrategy;
+    use std::time::Duration;
+
+    fn test_app() -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, InputPlugin));
+        app.init_resource::<Assets<Mesh>>();
+        app.init_resource::<Assets<StandardMaterial>>();
+        app.insert_resource(WorldGen(Megastructure { seed: 7, stratum_height_cells: 256 }));
+        app.world_mut().spawn((Window::default(), PrimaryWindow));
+        app.add_systems(Startup, setup);
+        // Fixed-step clock: each update advances exactly 1/60 s, so the
+        // tests are deterministic and independent of wall time.
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+            1.0 / 60.0,
+        )));
+        app.add_systems(Update, (grab_pointer, look, walk));
+        app.update(); // runs setup once
+        app
+    }
+
+    fn step(app: &mut App) {
+        app.update();
+    }
+
+    fn key(app: &mut App, key_code: KeyCode, logical_key: Key, state: ButtonState) {
+        app.world_mut().send_event(KeyboardInput {
+            key_code,
+            logical_key,
+            state,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+    }
+
+    fn one<T: Component + Clone, F: bevy::ecs::query::QueryFilter>(app: &mut App) -> T {
+        // Split across statements: QueryState is owned, so the world's
+        // mutable borrow ends before the shared reborrow in `single`.
+        let mut qs = app.world_mut().query_filtered::<&T, F>();
+        qs.single(app.world()).unwrap().clone()
+    }
+
+    fn grab_mode(app: &mut App) -> CursorGrabMode {
+        let mut qs = app.world_mut().query_filtered::<&Window, With<PrimaryWindow>>();
+        qs.single(app.world()).unwrap().cursor_options.grab_mode
+    }
+
+    fn player_pos(app: &mut App) -> Vec3 {
+        one::<Transform, With<Player>>(app).translation
+    }
+
+    type CamFilter = (With<Camera>, Without<Player>);
+
+    fn cam_pos(app: &mut App) -> Vec3 {
+        one::<Transform, CamFilter>(app).translation
+    }
+
+    #[test]
+    fn falls_lands_walks_and_jumps() {
+        let mut app = test_app();
+        let start = player_pos(&mut app);
+
+        // Gravity pulls the body onto the gallery floor.
+        for _ in 0..120 {
+            step(&mut app);
+        }
+        let landed = player_pos(&mut app);
+        assert!(landed.y < start.y, "fell from spawn");
+        let grounded = one::<Player, With<Player>>(&mut app)
+            .grounded;
+        assert!(grounded, "resting on the floor after 2 s");
+
+        // Hold W: walk forward (-z at yaw 0).
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyW);
+        for _ in 0..120 {
+            step(&mut app);
+        }
+        let walked = player_pos(&mut app);
+        assert!(
+            walked.z < landed.z - 2.0,
+            "walked forward, z {} -> {}",
+            landed.z,
+            walked.z
+        );
+
+        // Jump: feet leave the floor, then land again.
+        key(&mut app, KeyCode::Space, Key::Space, ButtonState::Pressed);
+        step(&mut app);
+        key(&mut app, KeyCode::Space, Key::Space, ButtonState::Released);
+        let mut apex = walked.y;
+        let mut relanded = false;
+        for _ in 0..180 {
+            step(&mut app);
+            let p = player_pos(&mut app);
+            apex = apex.max(p.y);
+            if one::<Player, With<Player>>(&mut app)
+                .grounded
+            {
+                relanded = true;
+                break;
+            }
+        }
+        assert!(apex > walked.y + 0.3, "jump gained height, apex {apex}");
+        assert!(relanded, "landed again after the jump");
+
+        // Camera keeps its boom behind the head.
+        let cam = cam_pos(&mut app);
+        let head = player_pos(&mut app);
+        let dist = ((cam.x - head.x).powi(2) + (cam.z - head.z).powi(2)).sqrt();
+        assert!((dist - CAMERA_BOOM).abs() < 0.6, "boom length, got {dist}");
+        assert!(cam.z > head.z, "camera trails behind forward motion");
+    }
+
+    #[test]
+    fn click_locks_pointer_and_mouse_turns() {
+        let mut app = test_app();
+        // Click captures the pointer.
+        app.world_mut().send_event(MouseButtonInput {
+            button: MouseButton::Left,
+            state: ButtonState::Pressed,
+            window: Entity::PLACEHOLDER,
+        });
+        step(&mut app);
+        assert_eq!(grab_mode(&mut app), CursorGrabMode::Locked);
+
+        // Mouse motion turns the player.
+        let yaw0 = one::<Player, With<Player>>(&mut app)
+            .yaw;
+        app.world_mut().send_event(MouseMotion { delta: Vec2::new(100.0, 50.0) });
+        step(&mut app);
+        let player = one::<Player, With<Player>>(&mut app);
+        assert!((player.yaw - (yaw0 - 0.25)).abs() < 1e-4, "yaw {}", player.yaw);
+        assert!((player.pitch - (-0.15 - 0.125)).abs() < 1e-4, "pitch {}", player.pitch);
+
+        // Esc releases.
+        key(&mut app, KeyCode::Escape, Key::Escape, ButtonState::Pressed);
+        step(&mut app);
+        assert_eq!(grab_mode(&mut app), CursorGrabMode::None);
+    }
+
+    #[test]
+    fn scene_has_fog_and_glow_strips() {
+        let mut app = test_app();
+        let fog = one::<DistanceFog, With<Camera>>(&mut app);
+        assert!(matches!(fog.falloff, FogFalloff::Exponential { .. }));
+
+        let materials = app.world_mut().resource::<Assets<StandardMaterial>>();
+        let glowing = materials.iter().filter(|(_, m)| m.emissive != LinearRgba::BLACK).count();
+        assert!(glowing >= 1, "at least one emissive strip material");
     }
 }
 
