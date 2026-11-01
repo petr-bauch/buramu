@@ -21,7 +21,9 @@ cargo run -p buramu_app
 Controls: click to lock the pointer, WASD + mouse to move, Space to
 jump, LMB fires the GBE (carves the world), Delete resets all edits,
 Esc releases the pointer. Carved edits autosave to `buramu-save.json`
-in the working directory and reload on the next start.
+in the working directory and reload on the next start. A builder
+drone regrows carved holes over time (fresh damage gets a few seconds
+of grace), and its repairs are saved the same way.
 
 If the shared cargo cache is read-only in your shell, point cargo at a
 writable home first (sandboxed shells hit this):

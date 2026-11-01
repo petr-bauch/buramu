@@ -19,9 +19,14 @@ generator). Surface Nets chunk meshes around spawn replace the M1
 placeholder planes; touched chunks remesh in place. Edits autosave to
 `buramu-save.json` and reload on startup; Delete resets the world.
 
-## M3 — builder regrowth
+## M3 — builder regrowth (done)
 
 Background actor adds material back on a timer. Distant simulation stays `i64`-based.
+
+A hovering builder drone reverts GBE damage rim-first via
+`buramu_world::regrow` (pure lattice logic, plus pruning of redundant
+overrides), remeshing touched chunks and autosaving on a throttle.
+Fresh damage gets a 5 s grace period so the player can out-carve it.
 
 ## M4 — first boss
 

@@ -6,7 +6,7 @@ use bevy::render::RenderPlugin;
 use bevy::window::{CursorGrabMode, PrimaryWindow};
 use buramu_gen::Megastructure;
 use buramu_world::collision::{MoveParams, move_body};
-use buramu_world::{carve_capsule, ChunkId, EditStore, LayeredField, Sdf, CHUNK_SIZE};
+use buramu_world::{carve_capsule, regrow, ChunkId, EditStore, LayeredField, Sdf, CHUNK_SIZE};
 use std::path::Path;
 
 mod mesher;
@@ -26,6 +26,10 @@ const GBE_RADIUS: f64 = 1.25;
 const GBE_RANGE: f32 = 40.0;
 const GBE_PENETRATION: f32 = 3.0;
 const GBE_COOLDOWN_S: f32 = 0.25;
+const BUILDER_TICK_S: f32 = 0.25;
+const BUILDER_CELLS_PER_TICK: usize = 12;
+const BUILDER_GRACE_S: f32 = 5.0;
+const SAVE_THROTTLE_S: f32 = 2.0;
 
 /// Backend set for wgpu. Defaults to the primary native backends
 /// (Vulkan / DX12 / Metal), never OpenGL: wgpu's GL backend fails Bevy
@@ -70,7 +74,7 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            (grab_pointer, look, fire_beam, update_beams, reset_edits, walk),
+            (grab_pointer, look, fire_beam, update_beams, reset_edits, builder, walk),
         )
         .run();
 }
@@ -94,6 +98,20 @@ struct FireState {
 
 #[derive(Resource)]
 struct BeamMaterial(Handle<StandardMaterial>);
+
+#[derive(Component)]
+struct Builder {
+    home: Vec3,
+}
+
+#[derive(Resource, Default)]
+struct BuilderState {
+    tick: f32,
+    last_shot_at: f32,
+    repair_site: Option<Vec3>,
+    save_dirty: bool,
+    save_timer: f32,
+}
 
 #[derive(Component, Clone, Copy)]
 struct Player {
@@ -207,13 +225,33 @@ fn setup(
             BODY.radius as f32,
             (BODY.height - 2.0 * BODY.radius) as f32,
         ))),
-        MeshMaterial3d(coat),
+        MeshMaterial3d(coat.clone()),
         Transform::from_translation(Vec3::new(
             spawn[0] as f32,
             (spawn[1] + BODY.height * 0.5) as f32,
             spawn[2] as f32,
         )),
     ));
+
+    // The builder: a hovering drone that regrows GBE damage (M3).
+    // Dark hull, emissive core, parked above the spawn corridor.
+    let home = Vec3::new(spawn[0] as f32 + 3.0, 3.4, spawn[2] as f32 + 3.0);
+    commands
+        .spawn((
+            Builder { home },
+            Mesh3d(meshes.add(Cuboid::new(0.55, 0.32, 0.55))),
+            MeshMaterial3d(coat),
+            Transform::from_translation(home),
+        ))
+        .with_child((
+            Mesh3d(meshes.add(Cuboid::new(0.2, 0.12, 0.2))),
+            MeshMaterial3d(strip.clone()),
+            Transform::from_xyz(0.0, -0.22, 0.0),
+        ));
+    commands.insert_resource(BuilderState {
+        last_shot_at: -BUILDER_GRACE_S,
+        ..default()
+    });
 
     commands.spawn((
         Camera3d::default(),
@@ -299,6 +337,7 @@ fn fire_beam(
     mut meshes: ResMut<Assets<Mesh>>,
     mut field: ResMut<FieldRes>,
     mut state: ResMut<FireState>,
+    mut builder_state: ResMut<BuilderState>,
     mut chunks: Query<(&ChunkTag, &mut Mesh3d)>,
 ) {
     state.cooldown = (state.cooldown - time.delta_secs()).max(0.0);
@@ -340,10 +379,9 @@ fn fire_beam(
         GBE_RADIUS,
     );
     remesh_chunks(&affected, &field.0, &mut meshes, &mut chunks);
-    if let Err(e) = field.0.edits.save(Path::new(SAVE_PATH), WORLD_SEED) {
-        bevy::log::warn!("could not save edits to {SAVE_PATH}: {e}");
-    }
+    save_edits(&field.0);
     state.cooldown = GBE_COOLDOWN_S;
+    builder_state.last_shot_at = time.elapsed_secs();
 
     // Brief emissive beam visual from just ahead of the camera.
     if let Some(material) = beam_material {
@@ -379,6 +417,7 @@ fn update_beams(
 fn reset_edits(
     keys: Res<ButtonInput<KeyCode>>,
     mut field: ResMut<FieldRes>,
+    mut builder_state: ResMut<BuilderState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut chunks: Query<(&ChunkTag, &mut Mesh3d)>,
 ) {
@@ -386,9 +425,100 @@ fn reset_edits(
         return;
     }
     field.0.edits.clear();
+    builder_state.repair_site = None;
+    builder_state.save_dirty = false;
     let _ = std::fs::remove_file(SAVE_PATH);
     let all: Vec<ChunkId> = chunks.iter().map(|(tag, _)| tag.0).collect();
     remesh_chunks(&all, &field.0, &mut meshes, &mut chunks);
+}
+
+/// The builder drone: steers toward the current repair site (or a slow
+/// patrol when the world is pristine) and, on a timer, regrows damaged
+/// cells rim-first via `buramu_world::regrow`. Fresh GBE damage gets a
+/// grace period so the player can out-carve the repair.
+#[allow(clippy::too_many_arguments)]
+fn builder(
+    time: Res<Time>,
+    mut field: ResMut<FieldRes>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut state: ResMut<BuilderState>,
+    mut chunks: Query<(&ChunkTag, &mut Mesh3d)>,
+    mut drones: Query<(&Builder, &mut Transform)>,
+) {
+    let dt = time.delta_secs();
+    let now = time.elapsed_secs();
+
+    // Fly: hover above the repair site, else patrol around home.
+    for (drone, mut tf) in &mut drones {
+        let patrol = drone.home
+            + Vec3::new(
+                (now * 0.25).sin() * 5.0,
+                (now * 0.8).sin() * 0.3,
+                (now * 0.25).cos() * 5.0,
+            );
+        let goal = state
+            .repair_site
+            .map(|site| site + Vec3::new(0.0, 1.6, 0.0))
+            .unwrap_or(patrol);
+        let blend = 1.0 - (-2.0 * dt).exp();
+        let delta = goal - tf.translation;
+        tf.translation += delta * blend;
+    }
+
+    // Throttled autosave while repair is in progress.
+    state.save_timer += dt;
+    if state.save_dirty && state.save_timer >= SAVE_THROTTLE_S {
+        save_edits(&field.0);
+        state.save_dirty = false;
+        state.save_timer = 0.0;
+    }
+
+    state.tick += dt;
+    if state.tick < BUILDER_TICK_S {
+        return;
+    }
+    state.tick = 0.0;
+    if now - state.last_shot_at < BUILDER_GRACE_S || field.0.edits.is_empty() {
+        state.repair_site = None;
+        return;
+    }
+
+    let LayeredField { edits, base } = &mut field.0;
+    let reverted = regrow(edits, base, BUILDER_CELLS_PER_TICK);
+    if reverted.is_empty() {
+        state.repair_site = None;
+        return;
+    }
+    let mut sum = Vec3::ZERO;
+    for cell in &reverted {
+        sum += Vec3::new(
+            cell.0[0] as f32 + 0.5,
+            cell.0[1] as f32 + 0.5,
+            cell.0[2] as f32 + 0.5,
+        );
+    }
+    state.repair_site = Some(sum / reverted.len() as f32);
+
+    let mut affected: Vec<ChunkId> =
+        reverted.iter().map(|cell| cell.chunk().0).collect();
+    affected.sort_by_key(|c| c.0);
+    affected.dedup();
+    remesh_chunks(&affected, &field.0, &mut meshes, &mut chunks);
+
+    state.save_dirty = true;
+    if field.0.edits.is_empty() {
+        // Repair complete: persist immediately, go back to patrol.
+        save_edits(&field.0);
+        state.save_dirty = false;
+        state.save_timer = 0.0;
+        state.repair_site = None;
+    }
+}
+
+fn save_edits(field: &LayeredField<Megastructure>) {
+    if let Err(e) = field.edits.save(Path::new(SAVE_PATH), WORLD_SEED) {
+        bevy::log::warn!("could not save edits to {SAVE_PATH}: {e}");
+    }
 }
 
 fn walk(
@@ -495,7 +625,7 @@ mod headless {
         )));
         app.add_systems(
             Update,
-            (grab_pointer, look, fire_beam, update_beams, reset_edits, walk),
+            (grab_pointer, look, fire_beam, update_beams, reset_edits, builder, walk),
         );
         app.update(); // runs setup once
         app
@@ -693,6 +823,49 @@ mod headless {
         step(&mut app);
         key(&mut app, KeyCode::Delete, Key::Delete, ButtonState::Released);
         assert_eq!(edit_count(&mut app), 0, "delete cleared the edits");
+    }
+
+    #[test]
+    fn builder_regrows_what_the_gbe_carves() {
+        let mut app = test_app();
+        let mut drone_q = app.world_mut().query_filtered::<&Transform, With<Builder>>();
+        assert_eq!(drone_q.iter(app.world()).count(), 1, "one builder drone");
+        let drone_start = *drone_q.single(app.world()).unwrap();
+
+        // Land, lock, and fire (same path as the carve test).
+        for _ in 0..120 {
+            step(&mut app);
+        }
+        mouse(&mut app, ButtonState::Pressed);
+        step(&mut app);
+        mouse(&mut app, ButtonState::Released);
+        step(&mut app);
+        mouse(&mut app, ButtonState::Pressed);
+        step(&mut app);
+        mouse(&mut app, ButtonState::Released);
+        step(&mut app);
+        let carved = edit_count(&mut app);
+        assert!(carved > 0, "hole carved before repair");
+
+        // Grace period first, then the builder must close the hole.
+        let mut steps = 0;
+        while edit_count(&mut app) > 0 && steps < 9000 {
+            step(&mut app);
+            steps += 1;
+        }
+        assert_eq!(
+            edit_count(&mut app),
+            0,
+            "builder restored all {carved} cells in {steps} steps"
+        );
+        let mut drone_q = app.world_mut().query_filtered::<&Transform, With<Builder>>();
+        let drone_end = *drone_q.single(app.world()).unwrap();
+        assert!(
+            drone_end.translation.distance(drone_start.translation) > 0.5,
+            "drone flew from {} to {}",
+            drone_start.translation,
+            drone_end.translation
+        );
     }
 }
 

@@ -132,6 +132,14 @@ impl EditStore {
         self.cells.get(&cell).copied()
     }
 
+    pub fn remove(&mut self, cell: CellId) -> Option<f32> {
+        self.cells.remove(&cell)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (CellId, f32)> + '_ {
+        self.cells.iter().map(|(cell, value)| (*cell, *value))
+    }
+
     pub fn set(&mut self, cell: CellId, value: f32) {
         self.cells.insert(cell, value);
     }
@@ -253,6 +261,57 @@ pub fn carve_capsule(
     chunks
 }
 
+/// Builder regrowth: revert up to `max_cells` edited cells back to
+/// the base field. Damaged cells (override differs from the base)
+/// revert rim first — a damaged cell is on the rim when at least
+/// one of its six neighbours is undamaged, so holes shrink inward
+/// from their edges. Redundant overrides (same value as the base,
+/// e.g. carve residue in open air) are always cleaned up, keeping
+/// the store a minimal diff. Pure `i64` lattice logic: identical
+/// at any distance from the origin. Returns the reverted cells in
+/// deterministic order.
+pub fn regrow<B: Sdf>(
+    edits: &mut EditStore,
+    base: &B,
+    max_cells: usize,
+) -> Vec<CellId> {
+    let damaged = |edits: &EditStore, cell: CellId| -> bool {
+        match edits.get(cell) {
+            Some(value) => value != base.distance(cell),
+            None => false,
+        }
+    };
+    let mut candidates: Vec<CellId> = edits
+        .iter()
+        .filter(|(cell, value)| {
+            *value == base.distance(*cell) || damaged(edits, *cell)
+        })
+        .map(|(cell, _)| cell)
+        .filter(|cell| {
+            if edits.get(*cell) == Some(base.distance(*cell)) {
+                return true; // redundant override: always cleanable
+            }
+            let [x, y, z] = cell.0;
+            [
+                [x + 1, y, z],
+                [x - 1, y, z],
+                [x, y + 1, z],
+                [x, y - 1, z],
+                [x, y, z + 1],
+                [x, y, z - 1],
+            ]
+            .iter()
+            .any(|n| !damaged(edits, CellId(*n)))
+        })
+        .collect();
+    candidates.sort_by_key(|cell| cell.0);
+    candidates.truncate(max_cells);
+    for cell in &candidates {
+        edits.remove(*cell);
+    }
+    candidates
+}
+
 pub struct EmptyShaft;
 
 impl Sdf for EmptyShaft {
@@ -323,6 +382,46 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         // Missing file is also `None`.
         assert!(EditStore::load(&path, 7).unwrap().is_none());
+    }
+
+    #[test]
+    fn regrow_restores_base_and_peels_rim_first() {
+        struct AllSolid;
+        impl Sdf for AllSolid {
+            fn distance(&self, _cell: CellId) -> f32 {
+                -1.0
+            }
+        }
+        // A 3x3x3 carved cube in solid rock.
+        let mut edits = EditStore::new();
+        for x in 0..3 {
+            for y in 0..3 {
+                for z in 0..3 {
+                    edits.set(CellId([x, y, z]), 1.0);
+                }
+            }
+        }
+        // One step only: the centre (all neighbours damaged) must wait.
+        let reverted = regrow(&mut edits, &AllSolid, 1);
+        assert_eq!(reverted.len(), 1);
+        assert_eq!(edits.get(CellId([1, 1, 1])), Some(1.0), "centre is not rim");
+        // Regrow to completion: every override disappears.
+        while !edits.is_empty() {
+            assert!(!regrow(&mut edits, &AllSolid, 4).is_empty());
+        }
+        let field = LayeredField { base: AllSolid, edits };
+        assert_eq!(field.distance(CellId([1, 1, 1])), -1.0);
+    }
+
+    #[test]
+    fn regrow_on_undamaged_store_is_noop() {
+        let mut edits = EditStore::new();
+        assert!(regrow(&mut edits, &EmptyShaft, 8).is_empty());
+        // An override identical to the base is not damage, but it is
+        // redundant: regrow prunes it to keep the diff minimal.
+        edits.set(CellId([0, 0, 0]), 1.0);
+        assert_eq!(regrow(&mut edits, &EmptyShaft, 8), vec![CellId([0, 0, 0])]);
+        assert!(edits.is_empty());
     }
 
     #[test]
