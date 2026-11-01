@@ -47,7 +47,9 @@ impl Sdf for Megastructure {
         let gallery = y.rem_euclid(16) < 3;
         // Sparse noise rooms so it is not a perfect grid.
         let noise = hash01(x / 8, y / 8, z / 8, self.seed) > 0.93;
-        if shaft || gallery || noise { 1.0 } else { -1.0 }
+        // Scripted boss arena (M4): a tall chamber north of spawn.
+        let arena = (8..40).contains(&x) && (-40..-8).contains(&z) && (0..13).contains(&y);
+        if shaft || gallery || noise || arena { 1.0 } else { -1.0 }
     }
 }
 

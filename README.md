@@ -23,7 +23,9 @@ jump, LMB fires the GBE (carves the world), Delete resets all edits,
 Esc releases the pointer. Carved edits autosave to `buramu-save.json`
 in the working directory and reload on the next start. A builder
 drone regrows carved holes over time (fresh damage gets a few seconds
-of grace), and its repairs are saved the same way.
+of grace), and its repairs are saved the same way. Head north from
+spawn to find the boss arena: destroy all three glowing weak points
+with the GBE to down the colossus.
 
 If the shared cargo cache is read-only in your shell, point cargo at a
 writable home first (sandboxed shells hit this):

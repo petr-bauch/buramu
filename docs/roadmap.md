@@ -28,6 +28,13 @@ A hovering builder drone reverts GBE damage rim-first via
 overrides), remeshing touched chunks and autosaving on a throttle.
 Fresh damage gets a 5 s grace period so the player can out-carve it.
 
-## M4 — first boss
+## M4 — first boss (done)
 
 One scripted arena boss. Rigged mesh + weak-point sockets + foot IK via `distance_at`.
+
+A colossus waits in a scripted arena chamber north of spawn (carved
+by `buramu_gen`). Articulated primitive build in `crates/app/src/boss.rs`
+until a rigged glTF exists: four feet planted/grounded through the SDF,
+diagonal gait, stomp knockback, three emissive weak-point sockets that
+take GBE hits (3 each). Destroying all sockets downs the boss. The
+builder keeps repairing the arena while you fight.

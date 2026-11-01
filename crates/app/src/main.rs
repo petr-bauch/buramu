@@ -9,6 +9,7 @@ use buramu_world::collision::{MoveParams, move_body};
 use buramu_world::{carve_capsule, regrow, ChunkId, EditStore, LayeredField, Sdf, CHUNK_SIZE};
 use std::path::Path;
 
+mod boss;
 mod mesher;
 use mesher::mesh_chunk;
 
@@ -74,7 +75,7 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            (grab_pointer, look, fire_beam, update_beams, reset_edits, builder, walk),
+            (grab_pointer, look, fire_beam, update_beams, reset_edits, builder, boss::boss_update, walk),
         )
         .run();
 }
@@ -253,6 +254,8 @@ fn setup(
         ..default()
     });
 
+    boss::spawn_boss(&mut commands, &mut meshes, &mut materials, &field.0);
+
     commands.spawn((
         Camera3d::default(),
         DistanceFog {
@@ -338,6 +341,8 @@ fn fire_beam(
     mut field: ResMut<FieldRes>,
     mut state: ResMut<FireState>,
     mut builder_state: ResMut<BuilderState>,
+    mut std_materials: ResMut<Assets<StandardMaterial>>,
+    mut weak_points: Query<(Entity, &GlobalTransform, &mut boss::WeakPoint)>,
     mut chunks: Query<(&ChunkTag, &mut Mesh3d)>,
 ) {
     state.cooldown = (state.cooldown - time.delta_secs()).max(0.0);
@@ -362,24 +367,49 @@ fn fire_beam(
 
     // March the same field the body collides with until solid.
     let mut end = origin + dir * GBE_RANGE;
+    let mut field_t = GBE_RANGE;
     let mut t = 0.5;
     while t < GBE_RANGE {
         let p = origin + dir * t;
         if field.0.sample([p.x as f64, p.y as f64, p.z as f64]) < 0.0 {
+            field_t = t;
             end = p + dir * GBE_PENETRATION;
             break;
         }
         t += 0.1;
     }
 
-    let affected = carve_capsule(
-        &mut field.0.edits,
-        [origin.x as f64, origin.y as f64, origin.z as f64],
-        [end.x as f64, end.y as f64, end.z as f64],
-        GBE_RADIUS,
-    );
-    remesh_chunks(&affected, &field.0, &mut meshes, &mut chunks);
-    save_edits(&field.0);
+    // Boss weak points eat the beam before the field does.
+    let mut weak_hit: Option<(f32, Entity)> = None;
+    for (entity, gt, wp) in &weak_points {
+        if wp.destroyed {
+            continue;
+        }
+        if let Some(t) = boss::ray_sphere(origin, dir, gt.translation(), 0.65) {
+            if t < field_t && weak_hit.is_none_or(|(best, _)| t < best) {
+                weak_hit = Some((t, entity));
+            }
+        }
+    }
+    if let Some((t, entity)) = weak_hit {
+        if let Ok((_, _, mut wp)) = weak_points.get_mut(entity) {
+            if wp.damage() {
+                if let Some(m) = std_materials.get_mut(&wp.material) {
+                    m.emissive = LinearRgba::new(0.25, 0.04, 0.02, 1.0);
+                }
+            }
+        }
+        end = origin + dir * t;
+    } else {
+        let affected = carve_capsule(
+            &mut field.0.edits,
+            [origin.x as f64, origin.y as f64, origin.z as f64],
+            [end.x as f64, end.y as f64, end.z as f64],
+            GBE_RADIUS,
+        );
+        remesh_chunks(&affected, &field.0, &mut meshes, &mut chunks);
+        save_edits(&field.0);
+    }
     state.cooldown = GBE_COOLDOWN_S;
     builder_state.last_shot_at = time.elapsed_secs();
 
@@ -625,7 +655,7 @@ mod headless {
         )));
         app.add_systems(
             Update,
-            (grab_pointer, look, fire_beam, update_beams, reset_edits, builder, walk),
+            (grab_pointer, look, fire_beam, update_beams, reset_edits, builder, boss::boss_update, walk),
         );
         app.update(); // runs setup once
         app
@@ -866,6 +896,245 @@ mod headless {
             drone_start.translation,
             drone_end.translation
         );
+    }
+
+    #[test]
+    fn boss_stands_in_arena_with_grounded_feet() {
+        let mut app = test_app();
+        for _ in 0..30 {
+            step(&mut app);
+        }
+        let (phase, feet) = {
+            let mut boss_q = app.world_mut().query::<&boss::Boss>();
+            assert_eq!(boss_q.iter(app.world()).count(), 1, "one boss");
+            let boss = boss_q.single(app.world()).unwrap();
+            (boss.phase, boss.feet_positions())
+        };
+        assert_eq!(phase, boss::BossPhase::Dormant);
+        // Root must carry Visibility or meshed children warn (B0004).
+        let mut vis_q =
+            app.world_mut().query_filtered::<&Visibility, With<boss::Boss>>();
+        assert_eq!(vis_q.iter(app.world()).count(), 1, "boss root is visible");
+        let mut wp_q = app.world_mut().query::<&boss::WeakPoint>();
+        assert_eq!(wp_q.iter(app.world()).count(), 3, "three weak points");
+
+        let field = &app.world().resource::<FieldRes>().0;
+        for foot in feet {
+            let sample = field.sample([foot.x as f64, foot.y as f64, foot.z as f64]);
+            assert!(
+                sample.abs() < 0.65,
+                "foot at {foot:?} rests on the surface, sample {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn destroying_all_weak_points_downs_the_boss() {
+        let mut app = test_app();
+        for _ in 0..10 {
+            step(&mut app);
+        }
+        // Burn every socket down through the real damage path.
+        let mut wp_q = app.world_mut().query::<&mut boss::WeakPoint>();
+        for mut wp in wp_q.iter_mut(app.world_mut()) {
+            while !wp.destroyed {
+                wp.damage();
+            }
+        }
+        for _ in 0..150 {
+            step(&mut app);
+        }
+        let mut boss_q = app.world_mut().query::<&boss::Boss>();
+        let boss = boss_q.single(app.world()).unwrap();
+        assert_eq!(boss.phase, boss::BossPhase::Defeated);
+        let mut tf_q = app
+            .world_mut()
+            .query_filtered::<&Transform, With<boss::Boss>>();
+        let root = tf_q.single(app.world()).unwrap();
+        assert!(
+            root.rotation.z.abs() > 0.3,
+            "colossus tips over, rotation {}",
+            root.rotation
+        );
+    }
+
+    #[test]
+    fn gbe_downs_boss_through_real_fire_input() {
+        use std::time::Instant;
+
+        let mut app = test_app();
+        for _ in 0..10 {
+            step(&mut app);
+        }
+
+        // Teleport into the arena, 12 m south of the boss.
+        {
+            let mut q = app.world_mut().query::<(&mut Player, &mut Transform)>();
+            let (mut player, mut tf) = q.single_mut(app.world_mut()).unwrap();
+            tf.translation = Vec3::new(24.0, 0.4, -12.0);
+            player.vel = [0.0, 0.0, 0.0];
+        }
+        step(&mut app);
+
+        let mut frame_times: Vec<f32> = Vec::new();
+        let mut timed_step = |app: &mut App| {
+            let start = Instant::now();
+            step(app);
+            frame_times.push(start.elapsed().as_secs_f32() * 1000.0);
+        };
+
+        // Gait: while the boss advances, at least one foot must step,
+        // and a player standing at a landing foot gets shoved.
+        let feet_before = {
+            let mut q = app.world_mut().query::<&boss::Boss>();
+            q.single(app.world()).unwrap().feet_positions()
+        };
+        let mut knocked = false;
+        for _ in 0..900 {
+            // Stand on a mid-step foot's landing spot.
+            let feet = {
+                let mut q = app.world_mut().query::<&boss::Boss>();
+                q.single(app.world()).unwrap().feet_positions()
+            };
+            let field_sample = |p: Vec3| {
+                app.world()
+                    .resource::<FieldRes>()
+                    .0
+                    .sample([p.x as f64, p.y as f64, p.z as f64])
+            };
+            if let Some(foot) = feet.iter().find(|f| field_sample(**f) > 0.35) {
+                let mut q = app.world_mut().query::<(&mut Player, &mut Transform)>();
+                let (mut player, mut tf) = q.single_mut(app.world_mut()).unwrap();
+                tf.translation = Vec3::new(foot.x, 0.4, foot.z);
+                player.vel = [0.0, 0.0, 0.0];
+            }
+            timed_step(&mut app);
+            let speed = {
+                let mut q = app.world_mut().query::<&Player>();
+                let p = q.single(app.world()).unwrap();
+                (p.vel[0] * p.vel[0] + p.vel[2] * p.vel[2]).sqrt()
+            };
+            if speed > 1.5 {
+                knocked = true;
+                break;
+            }
+        }
+        let feet_after = {
+            let mut q = app.world_mut().query::<&boss::Boss>();
+            q.single(app.world()).unwrap().feet_positions()
+        };
+        let stepped = feet_before
+            .iter()
+            .zip(feet_after.iter())
+            .any(|(a, b)| a.distance(*b) > 0.3);
+        assert!(stepped, "boss gait moved a foot while advancing");
+        assert!(knocked, "a landing foot shoved the player");
+
+        // Back off to shooting distance, lock the pointer.
+        {
+            let mut q = app.world_mut().query::<(&mut Player, &mut Transform)>();
+            let (mut player, mut tf) = q.single_mut(app.world_mut()).unwrap();
+            tf.translation = Vec3::new(24.0, 0.4, -13.0);
+            player.vel = [0.0, 0.0, 0.0];
+        }
+        mouse(&mut app, ButtonState::Pressed);
+        step(&mut app);
+        mouse(&mut app, ButtonState::Released);
+        step(&mut app);
+        assert_eq!(grab_mode(&mut app), CursorGrabMode::Locked);
+
+        let total_hits = |app: &mut App| -> u32 {
+            let mut q = app.world_mut().query::<&boss::WeakPoint>();
+            q.iter(app.world()).map(|w| (3 - w.hits) as u32).sum()
+        };
+
+        // Aim through the real camera path and fire, socket by socket.
+        for shot in 0..40 {
+            if total_hits(&mut app) >= 9 {
+                break;
+            }
+            // Aim at the first live socket.
+            let target = {
+                let mut q = app
+                    .world_mut()
+                    .query::<(&boss::WeakPoint, &GlobalTransform)>();
+                let mut found = None;
+                for (w, gt) in q.iter(app.world()) {
+                    if !w.destroyed {
+                        found = Some(gt.translation());
+                        break;
+                    }
+                }
+                found.expect("a live weak point")
+            };
+            {
+                let mut q = app.world_mut().query::<(&mut Player, &Transform)>();
+                let (mut player, tf) = q.single_mut(app.world_mut()).unwrap();
+                let head = tf.translation + Vec3::new(0.0, BODY.height as f32 * 0.5 - 0.2, 0.0);
+                let dir = (target - head).normalize();
+                player.yaw = (-dir.x).atan2(-dir.z);
+                player.pitch = dir.y.asin().clamp(-1.4, 1.4);
+            }
+            timed_step(&mut app);
+            timed_step(&mut app);
+            let before = total_hits(&mut app);
+            mouse(&mut app, ButtonState::Pressed);
+            timed_step(&mut app);
+            mouse(&mut app, ButtonState::Released);
+            timed_step(&mut app);
+            for _ in 0..18 {
+                timed_step(&mut app);
+            }
+            assert!(
+                total_hits(&mut app) > before,
+                "shot {shot} registered a weak-point hit"
+            );
+        }
+        assert_eq!(total_hits(&mut app), 9, "all sockets burned down");
+
+        // Destroyed sockets went dark.
+        let sockets: Vec<(bool, Handle<StandardMaterial>)> = {
+            let mut q = app.world_mut().query::<&boss::WeakPoint>();
+            q.iter(app.world())
+                .map(|wp| (wp.destroyed, wp.material.clone()))
+                .collect()
+        };
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        for (destroyed, handle) in &sockets {
+            assert!(destroyed);
+            let m = materials.get(handle).unwrap();
+            assert!(
+                m.emissive.red < 1.0,
+                "socket darkened, emissive {}",
+                m.emissive.red
+            );
+        }
+
+        // The colossus tips over.
+        let mut downed = false;
+        for _ in 0..300 {
+            timed_step(&mut app);
+            let mut q = app
+                .world_mut()
+                .query_filtered::<&Transform, With<boss::Boss>>();
+            if q.single(app.world()).unwrap().rotation.z.abs() > 0.3 {
+                downed = true;
+                break;
+            }
+        }
+        assert!(downed, "boss tipped after losing all sockets");
+
+        // Frame-time stability over the whole encounter.
+        frame_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean = frame_times.iter().sum::<f32>() / frame_times.len() as f32;
+        let p95 = frame_times[frame_times.len() * 95 / 100];
+        eprintln!(
+            "encounter frames: n={} mean={mean:.2}ms p95={p95:.2}ms max={:.2}ms",
+            frame_times.len(),
+            frame_times.last().unwrap()
+        );
+        assert!(mean < 50.0, "mean frame time {mean}ms");
+        assert!(p95 < 250.0, "p95 frame time {p95}ms");
     }
 }
 
