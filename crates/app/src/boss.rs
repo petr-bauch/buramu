@@ -228,6 +228,7 @@ type PlayerQuery<'w, 's> = Query<
 
 pub fn boss_update(
     time: Res<Time>,
+    origin: Res<crate::WorldOrigin>,
     field: Res<FieldRes>,
     weak_points: Query<&WeakPoint>,
     mut boss_q: BossRootQuery,
@@ -238,7 +239,15 @@ pub fn boss_update(
     let Ok((mut boss, mut root)) = boss_q.single_mut() else {
         return;
     };
-    let player_pos = players.single().map(|(_, t)| t.translation).ok();
+    // Boss logic runs in logical world coordinates; rendered
+    // transforms are origin-local, converted at the edges.
+    let base = Vec3::new(
+        origin.0.base[0] as f32,
+        origin.0.base[1] as f32,
+        origin.0.base[2] as f32,
+    );
+    let mut root_world = root.translation + base;
+    let player_pos = players.single().map(|(_, t)| t.translation + base).ok();
 
     // Defeat: every socket destroyed downs the colossus.
     if boss.phase != BossPhase::Defeated
@@ -252,22 +261,23 @@ pub fn boss_update(
     if boss.phase == BossPhase::Defeated {
         boss.fall = (boss.fall + dt / 1.8).min(1.0);
         root.rotation = Quat::from_rotation_z(boss.fall * 1.35);
-        root.translation.y = BOSS_HOME.y - boss.fall * 1.4;
+        root.translation.y = BOSS_HOME.y - boss.fall * 1.4 - base.y;
         return; // legs freeze where they stand
     }
 
     // Wake and advance on the player, staying inside the arena.
     if let Some(player) = player_pos {
-        let to_player = player - root.translation;
+        let to_player = player - root_world;
         let dist = Vec3::new(to_player.x, 0.0, to_player.z).length();
         if boss.phase == BossPhase::Dormant && dist < WAKE_RANGE {
             boss.phase = BossPhase::Advance;
         }
         if boss.phase == BossPhase::Advance && dist > STOP_RANGE {
             let move_dir = Vec3::new(to_player.x, 0.0, to_player.z).normalize_or_zero();
-            root.translation += move_dir * BOSS_SPEED * dt;
-            root.translation.x = root.translation.x.clamp(ARENA_CLAMP_X.0, ARENA_CLAMP_X.1);
-            root.translation.z = root.translation.z.clamp(ARENA_CLAMP_Z.0, ARENA_CLAMP_Z.1);
+            root_world += move_dir * BOSS_SPEED * dt;
+            root_world.x = root_world.x.clamp(ARENA_CLAMP_X.0, ARENA_CLAMP_X.1);
+            root_world.z = root_world.z.clamp(ARENA_CLAMP_Z.0, ARENA_CLAMP_Z.1);
+            root.translation = root_world - base;
             let target_yaw = move_dir.x.atan2(move_dir.z);
             let mut delta = target_yaw - boss.yaw;
             while delta > std::f32::consts::PI {
@@ -286,7 +296,7 @@ pub fn boss_update(
     let stepping = boss.feet.iter().filter(|f| f.step_t.is_some()).count();
     let mut new_steps = 0;
     for (i, foot) in boss.feet.iter_mut().enumerate() {
-        let hip = root.translation + rotation * HIP_OFFSETS[i];
+        let hip = root_world + rotation * HIP_OFFSETS[i];
         if let Some(t) = foot.step_t {
             let t = (t + dt / STEP_TIME_S).min(1.0);
             if t >= 1.0 {
@@ -294,12 +304,13 @@ pub fn boss_update(
                 foot.step_t = None;
                 // Stomp: landing near the player shoves them.
                 if let Ok((mut player, player_tf)) = players.single_mut() {
+                    let player_world = player_tf.translation + base;
                     let d = Vec3::new(
-                        player_tf.translation.x - foot.pos.x,
+                        player_world.x - foot.pos.x,
                         0.0,
-                        player_tf.translation.z - foot.pos.z,
+                        player_world.z - foot.pos.z,
                     );
-                    if d.length() < 2.6 && player_tf.translation.y < foot.pos.y + 2.5 {
+                    if d.length() < 2.6 && player_world.y < foot.pos.y + 2.5 {
                         let push = d.normalize_or_zero() * 6.0;
                         player.vel[0] += push.x as f64;
                         player.vel[2] += push.z as f64;
@@ -330,11 +341,11 @@ pub fn boss_update(
 
     // Stretch each leg link between hip and foot.
     for (leg, mut tf) in &mut legs {
-        let hip = root.translation + rotation * HIP_OFFSETS[leg.0];
+        let hip = root_world + rotation * HIP_OFFSETS[leg.0];
         let foot = boss.feet[leg.0].pos;
         let delta = foot - hip;
         let len = delta.length().max(0.01);
-        tf.translation = hip + delta * 0.5;
+        tf.translation = hip + delta * 0.5 - base;
         tf.rotation = Quat::from_rotation_arc(Vec3::Y, delta / len);
         tf.scale = Vec3::new(1.0, len, 1.0);
     }

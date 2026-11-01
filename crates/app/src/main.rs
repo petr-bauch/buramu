@@ -6,7 +6,9 @@ use bevy::render::RenderPlugin;
 use bevy::window::{CursorGrabMode, PrimaryWindow};
 use buramu_gen::Megastructure;
 use buramu_world::collision::{MoveParams, move_body};
-use buramu_world::{carve_capsule, regrow, ChunkId, EditStore, LayeredField, Sdf, CHUNK_SIZE};
+use buramu_world::{
+    carve_capsule, regrow, ChunkId, EditStore, LayeredField, Origin, Sdf, CHUNK_SIZE,
+};
 use std::path::Path;
 
 mod boss;
@@ -31,6 +33,10 @@ const BUILDER_TICK_S: f32 = 0.25;
 const BUILDER_CELLS_PER_TICK: usize = 12;
 const BUILDER_GRACE_S: f32 = 5.0;
 const SAVE_THROTTLE_S: f32 = 2.0;
+/// Rebase the floating origin when the player drifts this far (m).
+const ORIGIN_THRESHOLD_M: f64 = 512.0;
+/// Chunk meshes built per frame by the streaming system.
+const MESH_BUDGET_PER_FRAME: usize = 8;
 
 /// Backend set for wgpu. Defaults to the primary native backends
 /// (Vulkan / DX12 / Metal), never OpenGL: wgpu's GL backend fails Bevy
@@ -72,16 +78,41 @@ fn main() {
             ..default()
         }))
         .insert_resource(FieldRes(initial_field()))
+        .insert_resource(WorldOrigin(Origin::new([0.0, 0.0, 0.0])))
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            (grab_pointer, look, fire_beam, update_beams, reset_edits, builder, boss::boss_update, walk),
+            (
+                grab_pointer,
+                look,
+                fire_beam,
+                update_beams,
+                reset_edits,
+                builder,
+                boss::boss_update,
+                rebase_origin,
+                streaming,
+                walk,
+            ),
         )
         .run();
 }
 
 #[derive(Resource)]
 struct FieldRes(LayeredField<Megastructure>);
+
+/// Floating origin: logical world positions are `f64`; everything
+/// rendered is local to this base. See `Origin::to_local`.
+#[derive(Resource)]
+struct WorldOrigin(Origin);
+
+#[derive(Resource)]
+struct ChunkMaterial(Handle<StandardMaterial>);
+
+#[derive(Resource, Default)]
+struct ChunkStreaming {
+    queue: Vec<ChunkId>,
+}
 
 #[derive(Component, Clone, Copy)]
 struct ChunkTag(ChunkId);
@@ -116,6 +147,8 @@ struct BuilderState {
 
 #[derive(Component, Clone, Copy)]
 struct Player {
+    /// Feet position in logical world meters (`f64`, origin-free).
+    pos: [f64; 3],
     vel: [f64; 3],
     grounded: bool,
     yaw: f32,
@@ -160,24 +193,10 @@ fn setup(
         cull_mode: None,
         ..default()
     });
-    let center = chunk_of(spawn);
-    for dx in -MESH_RADIUS_CHUNKS..=MESH_RADIUS_CHUNKS {
-        for dy in -1..=0 {
-            for dz in -MESH_RADIUS_CHUNKS..=MESH_RADIUS_CHUNKS {
-                let chunk = ChunkId([center.0[0] + dx, center.0[1] + dy, center.0[2] + dz]);
-                commands.spawn((
-                    ChunkTag(chunk),
-                    Mesh3d(meshes.add(mesh_chunk(&field.0, chunk))),
-                    MeshMaterial3d(concrete.clone()),
-                    Transform::from_xyz(
-                        (chunk.0[0] * CHUNK_SIZE) as f32,
-                        (chunk.0[1] * CHUNK_SIZE) as f32,
-                        (chunk.0[2] * CHUNK_SIZE) as f32,
-                    ),
-                ));
-            }
-        }
-    }
+    // Chunk meshes are streamed around the player by `streaming`;
+    // setup only registers the shared material and the queue.
+    commands.insert_resource(ChunkMaterial(concrete));
+    commands.insert_resource(ChunkStreaming::default());
     commands.insert_resource(BeamMaterial(materials.add(StandardMaterial {
         base_color: Color::BLACK,
         emissive: LinearRgba::new(2.0, 6.0, 8.0, 1.0),
@@ -221,7 +240,7 @@ fn setup(
         ..default()
     });
     commands.spawn((
-        Player { vel: [0.0, 0.0, 0.0], grounded: false, yaw: 0.0, pitch: -0.15 },
+        Player { pos: spawn, vel: [0.0, 0.0, 0.0], grounded: false, yaw: 0.0, pitch: -0.15 },
         Mesh3d(meshes.add(Capsule3d::new(
             BODY.radius as f32,
             (BODY.height - 2.0 * BODY.radius) as f32,
@@ -265,6 +284,117 @@ fn setup(
             falloff: FogFalloff::from_visibility(70.0),
         },
     ));
+}
+
+/// Chunks that must never despawn: the boss arena (M4).
+fn pinned_chunks() -> Vec<ChunkId> {
+    let mut pinned = Vec::new();
+    for cx in 0..=1 {
+        for cy in -1..=0 {
+            for cz in -2..=-1 {
+                pinned.push(ChunkId([cx, cy, cz]));
+            }
+        }
+    }
+    pinned
+}
+
+/// Keep chunk meshes loaded around the player's logical position,
+/// building at most `MESH_BUDGET_PER_FRAME` per frame. Chunks outside
+/// the radius despawn (except the pinned boss arena).
+#[allow(clippy::too_many_arguments)]
+fn streaming(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    material: Res<ChunkMaterial>,
+    field: Res<FieldRes>,
+    origin: Res<WorldOrigin>,
+    players: Query<&Player>,
+    mut state: ResMut<ChunkStreaming>,
+    chunks: Query<(Entity, &ChunkTag, &Mesh3d)>,
+) {
+    let Ok(player) = players.single() else {
+        return;
+    };
+    // Centre on the body, not the feet: feet at y=-0.5 sit in the
+    // chunk below the one holding the gallery ceiling.
+    let center = chunk_of([
+        player.pos[0],
+        player.pos[1] + BODY.height * 0.5,
+        player.pos[2],
+    ]);
+    let mut desired = pinned_chunks();
+    for dx in -MESH_RADIUS_CHUNKS..=MESH_RADIUS_CHUNKS {
+        for dy in -1..=0 {
+            for dz in -MESH_RADIUS_CHUNKS..=MESH_RADIUS_CHUNKS {
+                desired.push(ChunkId([
+                    center.0[0] + dx,
+                    center.0[1] + dy,
+                    center.0[2] + dz,
+                ]));
+            }
+        }
+    }
+
+    let spawned: std::collections::HashSet<ChunkId> =
+        chunks.iter().map(|(_, tag, _)| tag.0).collect();
+    for (entity, tag, mesh) in &chunks {
+        if !desired.contains(&tag.0) {
+            commands.entity(entity).despawn();
+            meshes.remove(&mesh.0);
+        }
+    }
+    for chunk in &desired {
+        if !spawned.contains(chunk) && !state.queue.contains(chunk) {
+            state.queue.push(*chunk);
+        }
+    }
+    for _ in 0..MESH_BUDGET_PER_FRAME {
+        let Some(chunk) = state.queue.first().copied() else {
+            break;
+        };
+        state.queue.remove(0);
+        if spawned.contains(&chunk) || !desired.contains(&chunk) {
+            continue;
+        }
+        let local = origin.0.to_local([
+            (chunk.0[0] * CHUNK_SIZE) as f64,
+            (chunk.0[1] * CHUNK_SIZE) as f64,
+            (chunk.0[2] * CHUNK_SIZE) as f64,
+        ]);
+        commands.spawn((
+            ChunkTag(chunk),
+            Mesh3d(meshes.add(mesh_chunk(&field.0, chunk))),
+            MeshMaterial3d(material.0.clone()),
+            Transform::from_translation(Vec3::from_array(local)),
+        ));
+    }
+}
+
+/// Rebase the floating origin onto the player past the threshold and
+/// shift every root transform so rendering stays local. Logical
+/// positions (`Player::pos`, boss feet, builder sites) are `f64`
+/// world coordinates and do not move.
+fn rebase_origin(
+    mut origin: ResMut<WorldOrigin>,
+    players: Query<&Player>,
+    mut roots: Query<&mut Transform, Without<ChildOf>>,
+) {
+    let Ok(player) = players.single() else {
+        return;
+    };
+    let old = origin.0.base;
+    if !origin.0.rebase_if_needed(player.pos, ORIGIN_THRESHOLD_M) {
+        return;
+    }
+    let shift = Vec3::new(
+        (old[0] - origin.0.base[0]) as f32,
+        (old[1] - origin.0.base[1]) as f32,
+        (old[2] - origin.0.base[2]) as f32,
+    );
+    for mut tf in &mut roots {
+        tf.translation += shift;
+    }
 }
 
 /// Rebuild the meshes of already-spawned chunks after an edit.
@@ -343,6 +473,7 @@ fn fire_beam(
     mut builder_state: ResMut<BuilderState>,
     mut std_materials: ResMut<Assets<StandardMaterial>>,
     mut weak_points: Query<(Entity, &GlobalTransform, &mut boss::WeakPoint)>,
+    origin_base: Res<WorldOrigin>,
     mut chunks: Query<(&ChunkTag, &mut Mesh3d)>,
 ) {
     state.cooldown = (state.cooldown - time.delta_secs()).max(0.0);
@@ -362,7 +493,15 @@ fn fire_beam(
     let Ok(cam) = cameras.single() else {
         return;
     };
-    let origin = cam.translation;
+    // The camera lives in origin-local space; the field is logical.
+    // Directions are identical in both frames, distances too.
+    let base = Vec3::new(
+        origin_base.0.base[0] as f32,
+        origin_base.0.base[1] as f32,
+        origin_base.0.base[2] as f32,
+    );
+    let cam_local = cam.translation;
+    let origin = cam_local + base;
     let dir = cam.forward().as_vec3();
 
     // March the same field the body collides with until solid.
@@ -385,7 +524,7 @@ fn fire_beam(
         if wp.destroyed {
             continue;
         }
-        if let Some(t) = boss::ray_sphere(origin, dir, gt.translation(), 0.65) {
+        if let Some(t) = boss::ray_sphere(cam_local, dir, gt.translation(), 0.65) {
             if t < field_t && weak_hit.is_none_or(|(best, _)| t < best) {
                 weak_hit = Some((t, entity));
             }
@@ -423,7 +562,7 @@ fn fire_beam(
             Mesh3d(meshes.add(Cylinder::new(0.06, 1.0))),
             MeshMaterial3d(material.0.clone()),
             Transform {
-                translation: a + delta * 0.5,
+                translation: a + delta * 0.5 - base,
                 rotation: Quat::from_rotation_arc(Vec3::Y, delta / len),
                 scale: Vec3::new(1.0, len, 1.0),
             },
@@ -469,6 +608,7 @@ fn reset_edits(
 #[allow(clippy::too_many_arguments)]
 fn builder(
     time: Res<Time>,
+    origin: Res<WorldOrigin>,
     mut field: ResMut<FieldRes>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut state: ResMut<BuilderState>,
@@ -486,10 +626,17 @@ fn builder(
                 (now * 0.8).sin() * 0.3,
                 (now * 0.25).cos() * 5.0,
             );
+        // Sites and home are logical; the drone renders origin-local.
+        let base = Vec3::new(
+            origin.0.base[0] as f32,
+            origin.0.base[1] as f32,
+            origin.0.base[2] as f32,
+        );
         let goal = state
             .repair_site
             .map(|site| site + Vec3::new(0.0, 1.6, 0.0))
-            .unwrap_or(patrol);
+            .unwrap_or(patrol)
+            - base;
         let blend = 1.0 - (-2.0 * dt).exp();
         let delta = goal - tf.translation;
         tf.translation += delta * blend;
@@ -555,6 +702,7 @@ fn walk(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     gen: Res<FieldRes>,
+    origin: Res<WorldOrigin>,
     mut players: Query<(&mut Player, &mut Transform)>,
     mut cameras: Query<&mut Transform, (With<Camera>, Without<Player>)>,
 ) {
@@ -594,20 +742,18 @@ fn walk(
         player.vel[1] = JUMP_SPEED;
     }
 
-    let half = BODY.height as f32 * 0.5;
-    let feet = [
-        body.translation.x as f64,
-        (body.translation.y - half) as f64,
-        body.translation.z as f64,
-    ];
-    let (feet, vel, outcome) = move_body(feet, player.vel, dt, BODY, &|p| gen.0.sample(p));
+    // Physics runs on the logical `f64` feet; the rendered body is
+    // the same point converted into origin-local space.
+    let (feet, vel, outcome) =
+        move_body(player.pos, player.vel, dt, BODY, &|p| gen.0.sample(p));
+    player.pos = feet;
     player.vel = vel;
     player.grounded = outcome.grounded;
-    body.translation = Vec3::new(
-        feet[0] as f32,
-        (feet[1] + BODY.height * 0.5) as f32,
-        feet[2] as f32,
-    );
+    body.translation = Vec3::from_array(origin.0.to_local([
+        feet[0],
+        feet[1] + BODY.height * 0.5,
+        feet[2],
+    ]));
     // Face travel direction, keep it simple.
     if player.vel[0] * player.vel[0] + player.vel[2] * player.vel[2] > 0.5 {
         let face = player.vel[2].atan2(player.vel[0]) as f32 - std::f32::consts::FRAC_PI_2;
@@ -646,6 +792,7 @@ mod headless {
             seed: 7,
             stratum_height_cells: 256,
         })));
+        app.insert_resource(WorldOrigin(Origin::new([0.0, 0.0, 0.0])));
         app.world_mut().spawn((Window::default(), PrimaryWindow));
         app.add_systems(Startup, setup);
         // Fixed-step clock: each update advances exactly 1/60 s, so the
@@ -655,7 +802,18 @@ mod headless {
         )));
         app.add_systems(
             Update,
-            (grab_pointer, look, fire_beam, update_beams, reset_edits, builder, boss::boss_update, walk),
+            (
+                grab_pointer,
+                look,
+                fire_beam,
+                update_beams,
+                reset_edits,
+                builder,
+                boss::boss_update,
+                rebase_origin,
+                streaming,
+                walk,
+            ),
         );
         app.update(); // runs setup once
         app
@@ -801,6 +959,10 @@ mod headless {
     #[test]
     fn world_is_meshed_not_placeholder_planes() {
         let mut app = test_app();
+        // Streaming fills the radius over the first frames.
+        for _ in 0..30 {
+            step(&mut app);
+        }
         let mut qs = app.world_mut().query::<&ChunkTag>();
         let chunks = qs.iter(app.world()).count();
         assert!(chunks >= 9, "chunk meshes spawned around spawn, got {chunks}");
@@ -972,6 +1134,7 @@ mod headless {
             let mut q = app.world_mut().query::<(&mut Player, &mut Transform)>();
             let (mut player, mut tf) = q.single_mut(app.world_mut()).unwrap();
             tf.translation = Vec3::new(24.0, 0.4, -12.0);
+            player.pos = [24.0, -0.5, -12.0];
             player.vel = [0.0, 0.0, 0.0];
         }
         step(&mut app);
@@ -1006,6 +1169,7 @@ mod headless {
                 let mut q = app.world_mut().query::<(&mut Player, &mut Transform)>();
                 let (mut player, mut tf) = q.single_mut(app.world_mut()).unwrap();
                 tf.translation = Vec3::new(foot.x, 0.4, foot.z);
+                player.pos = [foot.x as f64, -0.5, foot.z as f64];
                 player.vel = [0.0, 0.0, 0.0];
             }
             timed_step(&mut app);
@@ -1035,6 +1199,7 @@ mod headless {
             let mut q = app.world_mut().query::<(&mut Player, &mut Transform)>();
             let (mut player, mut tf) = q.single_mut(app.world_mut()).unwrap();
             tf.translation = Vec3::new(24.0, 0.4, -13.0);
+            player.pos = [24.0, -0.5, -13.0];
             player.vel = [0.0, 0.0, 0.0];
         }
         mouse(&mut app, ButtonState::Pressed);
@@ -1135,6 +1300,74 @@ mod headless {
         );
         assert!(mean < 50.0, "mean frame time {mean}ms");
         assert!(p95 < 250.0, "p95 frame time {p95}ms");
+    }
+
+    #[test]
+    fn streaming_follows_a_100km_teleport() {
+        let mut app = test_app();
+        for _ in 0..30 {
+            step(&mut app);
+        }
+        // Teleport the logical position 100 km out. Find a verified
+        // floor spot out there first (noise cavities eat some floors).
+        let field = &app.world().resource::<FieldRes>().0;
+        let mut target = [100_008.5, 0.0, -99_991.5];
+        for dx in 0..64 {
+            let cand = [100_000.5 + dx as f64, 0.0, -99_991.5];
+            if field.sample([cand[0], 1.0, cand[2]]) > 0.5
+                && field.sample([cand[0], -1.0, cand[2]]) < 0.0
+            {
+                target = cand;
+                break;
+            }
+        }
+        {
+            let mut q = app.world_mut().query::<&mut Player>();
+            let mut player = q.single_mut(app.world_mut()).unwrap();
+            player.pos = target;
+            player.vel = [0.0, 0.0, 0.0];
+        }
+        for _ in 0..120 {
+            step(&mut app);
+        }
+
+        let player = one::<Player, With<Player>>(&mut app);
+        assert!(player.grounded, "landed on the far gallery floor");
+        assert!(
+            (player.pos[1] - (-0.5)).abs() < 0.1,
+            "feet on floor at {:?}",
+            player.pos
+        );
+
+        // The origin rebased onto the player; rendering stays local.
+        let base = app.world().resource::<WorldOrigin>().0.base;
+        assert!((base[0] - target[0]).abs() < 1.0, "origin x rebased: {base:?}");
+        assert!((base[2] - target[2]).abs() < 1.0, "origin z rebased: {base:?}");
+        let local = player_pos(&mut app);
+        assert!(local.length() < 64.0, "local render pos stays small: {local}");
+
+        // Streaming followed: far chunks loaded, spawn chunks gone,
+        // pinned arena chunks kept.
+        let mut qs = app.world_mut().query::<&ChunkTag>();
+        let loaded: Vec<ChunkId> = qs.iter(app.world()).map(|t| t.0).collect();
+        assert!(
+            loaded.contains(&chunk_of(target)),
+            "player chunk {:?} streamed in (player at {:?}, near: {:?})",
+            chunk_of(target),
+            player.pos,
+            loaded
+                .iter()
+                .filter(|c| (c.0[0] - 3125).abs() <= 2 && (c.0[2] + 3125).abs() <= 2)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !loaded.contains(&ChunkId([0, 0, 0])),
+            "spawn chunk despawned"
+        );
+        assert!(
+            loaded.contains(&ChunkId([0, 0, -1])),
+            "pinned arena chunk kept"
+        );
     }
 }
 
