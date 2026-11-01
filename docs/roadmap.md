@@ -4,9 +4,10 @@
 
 Workspace, crates, docs, placeholder Bevy scene. `cargo test` green.
 
-## M1 — walkable stratum
+## M1 — walkable stratum (done)
 
-Floor collider from SDF query. Third-person capsule. Fog and emissive strips for mood.
+Kinematic capsule vs SDF (`world::collision`), third-person controller,
+fog and emissive strips. Placeholder planes stand in for the mesher.
 
 ## M2 — GBE hole
 
