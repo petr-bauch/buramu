@@ -1,0 +1,36 @@
+[package]
+name = "buramu_app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "buramu"
+path = "src/main.rs"
+
+[dependencies]
+buramu_world = { path = "../world" }
+buramu_gen = { path = "../gen" }
+# No default features: `bevy_audio` needs system ALSA which may not be
+# installed. Re-enable `bevy_audio` + `vorbis` when sound lands (M4+).
+bevy = { version = "0.16", default-features = false, features = [
+    "std",
+    "async_executor",
+    "animation",
+    "bevy_asset",
+    "bevy_color",
+    "bevy_core_pipeline",
+    "bevy_gltf",
+    "bevy_log",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_scene",
+    "bevy_state",
+    "bevy_window",
+    "bevy_winit",
+    "x11",
+    "default_font",
+    "hdr",
+    "multi_threaded",
+    "png",
+    "tonemapping_luts",
+] }

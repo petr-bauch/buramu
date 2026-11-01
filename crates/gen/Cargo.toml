@@ -1,0 +1,7 @@
+[package]
+name = "buramu_gen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+buramu_world = { path = "../world" }
