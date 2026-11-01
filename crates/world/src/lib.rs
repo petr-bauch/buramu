@@ -9,6 +9,8 @@ pub const CHUNK_SIZE: i64 = 32;
 /// Size of one cell in meters.
 pub const CELL_SIZE_M: f64 = 1.0;
 
+pub mod collision;
+
 /// Canonical chunk id in lattice space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkId(pub [i64; 3]);

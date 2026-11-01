@@ -42,11 +42,36 @@ impl Sdf for Megastructure {
         let [x, y, z] = cell.0;
         // Vertical shaft every 64 cells.
         let shaft = x.rem_euclid(64) == 0 && z.rem_euclid(64) == 0;
-        // Horizontal gallery floor every 16 cells.
-        let gallery = y.rem_euclid(16) == 0;
+        // Horizontal gallery band every 16 cells. Three cells tall so a
+        // ~1.8 m capsule fits: interior surface spans y in [-0.5, 2.5].
+        let gallery = y.rem_euclid(16) < 3;
         // Sparse noise rooms so it is not a perfect grid.
         let noise = hash01(x / 8, y / 8, z / 8, self.seed) > 0.93;
         if shaft || gallery || noise { 1.0 } else { -1.0 }
+    }
+}
+
+impl Megastructure {
+    /// Continuous signed-field sample at a world position in meters.
+    ///
+    /// Trilinear interpolation of the integer lattice. Cell values sit on
+    /// integer corners, so the zero surface between solid (-1) and empty
+    /// (+1) cells lies exactly halfway: gallery floors at y = -0.5,
+    /// ceilings at y = 2.5 for the band at y in {0, 1, 2}.
+    pub fn sample(&self, p: [f64; 3]) -> f32 {
+        let x0 = p[0].floor() as i64;
+        let y0 = p[1].floor() as i64;
+        let z0 = p[2].floor() as i64;
+        let tx = (p[0] - x0 as f64) as f32;
+        let ty = (p[1] - y0 as f64) as f32;
+        let tz = (p[2] - z0 as f64) as f32;
+        let c = |x: i64, y: i64, z: i64| self.distance(CellId([x, y, z]));
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let x00 = lerp(c(x0, y0, z0), c(x0 + 1, y0, z0), tx);
+        let x10 = lerp(c(x0, y0 + 1, z0), c(x0 + 1, y0 + 1, z0), tx);
+        let x01 = lerp(c(x0, y0, z0 + 1), c(x0 + 1, y0, z0 + 1), tx);
+        let x11 = lerp(c(x0, y0 + 1, z0 + 1), c(x0 + 1, y0 + 1, z0 + 1), tx);
+        lerp(lerp(x00, x10, ty), lerp(x01, x11, ty), tz)
     }
 }
 
@@ -59,6 +84,38 @@ mod tests {
         let g = Megastructure { seed: 7, stratum_height_cells: 256 };
         let c = CellId([10, 20, 30]);
         assert_eq!(g.distance(c), g.distance(c));
+    }
+
+    #[test]
+    fn body_rests_on_gallery_floor() {
+        use buramu_world::collision::{MoveParams, move_body};
+        let g = Megastructure { seed: 7, stratum_height_cells: 256 };
+        // Find an empty corridor spot away from shafts.
+        let mut sx = None;
+        for x in 8..56 {
+            if g.sample([x as f64 + 0.5, 1.0, 8.5]) > 0.5 {
+                sx = Some(x as f64 + 0.5);
+                break;
+            }
+        }
+        let sx = sx.expect("an empty corridor exists");
+        let p = MoveParams { radius: 0.35, height: 1.8 };
+        let mut feet = [sx, 1.0, 8.5];
+        let mut vel = [0.0, 0.0, 0.0];
+        let mut grounded = false;
+        for _ in 0..240 {
+            vel[1] -= 20.0 * 0.016;
+            let (np, nv, o) = move_body(feet, vel, 0.016, p, &|q| g.sample(q));
+            feet = np;
+            vel = nv;
+            grounded = o.grounded;
+        }
+        assert!(grounded, "body should rest on the gallery floor");
+        assert!(
+            (feet[1] - (-0.5)).abs() < 0.1,
+            "feet on gallery floor y=-0.5, got {}",
+            feet[1]
+        );
     }
 
     #[test]
