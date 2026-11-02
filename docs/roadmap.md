@@ -53,13 +53,23 @@ meshing stays deferred. The teleport test also caught the streaming
 centre needing the body chunk, not the feet chunk (feet at y=-0.5
 sit one chunk below the gallery ceiling).
 
-## M6 — procedural grammar v2 + stratification
+## M6 — procedural grammar v2 + stratification (done)
 
 Replace gallery-bands-and-noise with a deterministic region grammar
 (decks, slab fields, shaft wells with landings, tunnels, chambers) on
 the same lattice SDF. Make strata real: per-stratum type/parameters
 from `hash(seed, stratum)`, shafts connecting levels. Connectivity and
 determinism tests; the boss arena must stay reachable.
+
+Landed: stratum 0 keeps the exact M1 rules (spawn/arena invariant);
+other strata derive deck period (12–24), 3x3 shaft wells, noise
+threshold, and chamber chance from `hash(seed, stratum)`, with
+per-stratum noise salt. Flood-fill tests prove decks connect
+vertically via shafts and spawn still reaches the arena. Slab fields
+and tunnels as distinct motifs are deferred until M7 dressing needs
+them. Note: reaching other strata in-game needs a way down/up —
+stratum 0's 1-cell shaft line is not traversable; wells only exist
+in strata != 0 for now.
 
 ## M7 — visual identity (the manga look)
 
